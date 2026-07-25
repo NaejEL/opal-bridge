@@ -29,11 +29,14 @@ The physical slide switch selects the mode: it is read **at boot**, and flipping
    scp -O -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa \
        opal-bridge_*.ipk root@192.168.8.1:/tmp/
    ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa \
-       root@192.168.8.1 "opkg install /tmp/opal-bridge_*.ipk"
+       root@192.168.8.1 "opkg update && opkg install /tmp/opal-bridge_*.ipk"
    ```
 
    > The `ssh-rsa` options are required: the Opal's old Dropbear offers no newer
    > host-key algorithm, and recent OpenSSH clients refuse it by default.
+   > The `opkg update` matters on a stock device: `relayd` (our dependency) is
+   > pulled from the GL.iNet feed, which needs fresh package lists — so the Opal
+   > must have Internet access (upstream WiFi joined) when you install.
 
 3. **Set the slide switch** to the mode you want and **reboot**. Done — the switch now drives the device, at boot and live.
 
