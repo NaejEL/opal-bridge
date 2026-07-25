@@ -1,0 +1,29 @@
+#!/bin/sh
+# opal-bridge: configure the opal.local mDNS alias (idempotent).
+# Called by postinst; re-run manually after installing avahi:
+#   opkg update && opkg install avahi-nodbus-daemon && /usr/lib/opal-bridge/setup-mdns
+log() { logger -t opal-bridge "$1"; echo "opal-bridge: $1"; }
+
+if [ ! -x /etc/init.d/avahi-daemon ]; then
+    log "avahi not installed - opal.local unavailable. To enable it run:"
+    log "  opkg update && opkg install avahi-nodbus-daemon && /usr/lib/opal-bridge/setup-mdns"
+    exit 0
+fi
+
+# announce ONLY br-lan (else the staX address is announced too and clients
+# may resolve opal.local to the wrong side)
+grep -q '^allow-interfaces=' /etc/avahi/avahi-daemon.conf || \
+    sed -i 's/^\[server\]/[server]\nallow-interfaces=br-lan/' /etc/avahi/avahi-daemon.conf
+
+HN=$(uci -q get system.@system[0].hostname)
+if [ "$HN" != "opal" ]; then
+    mkdir -p /etc/opal-mode
+    echo "$HN" > /etc/opal-mode/hostname.orig
+    uci set system.@system[0].hostname='opal'
+    uci commit system
+    echo opal > /proc/sys/kernel/hostname
+fi
+
+/etc/init.d/avahi-daemon enable 2>/dev/null
+/etc/init.d/avahi-daemon restart 2>/dev/null
+log "opal.local active (avahi on br-lan)"

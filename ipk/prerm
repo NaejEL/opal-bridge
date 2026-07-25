@@ -1,0 +1,9 @@
+#!/bin/sh
+# opal-bridge prerm - runs with our files still present: return to stock router
+[ -n "$IPKG_INSTROOT" ] && exit 0
+if [ "$(cat /etc/opal-mode/current 2>/dev/null)" = "bridge" ]; then
+    /usr/bin/opal-mode router 2>/dev/null
+fi
+/etc/init.d/opal-mode disable 2>/dev/null
+killall relayd 2>/dev/null
+exit 0

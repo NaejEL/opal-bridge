@@ -1,0 +1,17 @@
+#!/bin/sh
+# opal-bridge postrm - our files are gone: restore the stock managers
+[ -n "$IPKG_INSTROOT" ] && exit 0
+[ -f /root/30-relay.bak ] && mv /root/30-relay.bak /etc/hotplug.d/iface/30-relay
+[ -x /etc/init.d/relayd ] && /etc/init.d/relayd enable 2>/dev/null
+if [ -x /etc/init.d/gl_led ]; then
+    /etc/init.d/gl_led enable 2>/dev/null
+    /etc/init.d/gl_led start 2>/dev/null
+fi
+uci -q delete switch-button.@main[0].func && uci commit switch-button
+if [ -f /etc/opal-mode/hostname.orig ]; then
+    uci set system.@system[0].hostname="$(cat /etc/opal-mode/hostname.orig)"
+    uci commit system
+fi
+# avahi-nodbus-daemon is left installed (harmless, may serve other uses)
+rm -rf /etc/opal-mode /tmp/opal-mode.boot-done
+exit 0

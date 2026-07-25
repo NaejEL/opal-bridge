@@ -1,0 +1,8 @@
+#!/bin/sh /etc/rc.common
+# opal-bridge: read the slide switch at boot and swap mode config BEFORE
+# the consumers start (dnsmasq/firewall START=19, network START=20).
+START=15
+
+boot() {
+    /usr/bin/opal-mode apply-boot
+}

@@ -1,0 +1,113 @@
+#!/bin/sh
+# opal-bridge: dynamic L2 bridge (relayd) - zero hardcoded IPs.
+# Discovers subnet from the wwan DHCP lease, derives service IPs,
+# exempts hairpin traffic from masquerade, adapts lan addressing.
+# https://github.com/NaejEL/opal-bridge
+[ "$INTERFACE" = "wwan" ] || exit 0
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$(cat /etc/opal-mode/current 2>/dev/null)" = "router" ] && exit 0
+STA_IF="$DEVICE"
+[ -z "$STA_IF" ] && exit 0
+STAMP="$(date +%s).$$"
+echo "$STAMP" > /tmp/relayd.lastevent
+TRACE=/tmp/relayd-bridge.trace
+
+# ---- Discover lease: IP/prefix of the sta interface ----
+CIDR=$(ip -4 addr show "$STA_IF" | awk '/inet /{print $2; exit}')
+[ -z "$CIDR" ] && exit 0
+WAN_IP="${CIDR%/*}"; PLEN="${CIDR#*/}"
+
+# ---- Compute network base (ipcalc.sh ships with openwrt base) ----
+eval "$(ipcalc.sh "$CIDR")"      # sets IP, NETMASK, BROADCAST, NETWORK, PREFIX
+[ -z "$NETWORK" ] && exit 0
+SUBNET="$NETWORK/$PLEN"
+/usr/bin/opal-led bridge-converging
+
+# ---- Derive service IPs from the top of the subnet, verified free ----
+ip2int() {
+    oIFS=$IFS; IFS=.; set -- $1; IFS=$oIFS
+    echo $(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 ))
+}
+int2ip() {
+    echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"
+}
+NET_I=$(ip2int "$NETWORK"); BCAST_I=$(ip2int "$BROADCAST")
+HOSTS=$((BCAST_I - NET_I - 1))
+# need gateway + our wwan IP + 2 service IPs
+[ "$HOSTS" -ge 4 ] || { echo "$(date) subnet $SUBNET too small ($HOSTS hosts)" >> "$TRACE"; /usr/bin/opal-led error; exit 0; }
+MAXOFF=$HOSTS; [ $MAXOFF -gt 11 ] && MAXOFF=11
+
+is_free() {   # occupied if EITHER segment answers (wired side not bridged yet)
+    arping -I "$STA_IF" -c2 -w2 "$1" >/dev/null 2>&1 && return 1
+    arping -I br-lan   -c2 -w2 "$1" >/dev/null 2>&1 && return 1
+    return 0
+}
+pick_service_ips() {   # sets LAN_IP + RELAY_IP in one scan ; rc 1 if not enough
+    LAN_IP=""; RELAY_IP=""; n=1
+    while [ $n -le $MAXOFF ]; do
+        C=$(int2ip $((BCAST_I - n)))     # always inside (NETWORK, BROADCAST)
+        if [ "$C" != "$WAN_IP" ] && is_free "$C"; then
+            if [ -z "$LAN_IP" ]; then LAN_IP=$C; else RELAY_IP=$C; return 0; fi
+        fi
+        n=$((n+1))
+    done
+    return 1
+}
+
+STATE=/etc/opal-mode/bridge-state
+OLD_SUBNET=$(sed -n 's/^SUBNET=//p' "$STATE" 2>/dev/null)
+
+LAN_IP=$(sed -n 's/^LAN_IP=//p' "$STATE" 2>/dev/null)
+RELAY_IP=$(sed -n 's/^RELAY_IP=//p' "$STATE" 2>/dev/null)
+if [ "$SUBNET" != "$OLD_SUBNET" ] || [ -z "$LAN_IP" ] || [ -z "$RELAY_IP" ]; then
+    # New network (or unusable state file): derive fresh service IPs
+    pick_service_ips || { echo "$(date) no free service IPs in $SUBNET" >> "$TRACE"; /usr/bin/opal-led error; exit 0; }
+    mkdir -p /etc/opal-mode
+    printf 'SUBNET=%s\nLAN_IP=%s\nRELAY_IP=%s\n' "$SUBNET" "$LAN_IP" "$RELAY_IP" > "$STATE"
+    echo "$(date) new network $SUBNET -> lan=$LAN_IP relay=$RELAY_IP" >> "$TRACE"
+fi
+
+# ---- Reconfigure lan if needed (network change or runtime drift) ----
+if ! ip -4 addr show br-lan 2>/dev/null | grep -q "inet $LAN_IP/"; then
+    uci set network.lan.ipaddr="$LAN_IP"
+    uci set network.lan.netmask="$NETMASK"
+    uci commit network
+    echo "$(date) lan re-addressed to $LAN_IP/$PLEN (subnet $SUBNET)" >> "$TRACE"
+    # netifd only re-reads committed config on reload; iface down/up
+    # would re-apply the stale in-memory ipaddr (verified on device)
+    ubus call network reload 2>/dev/null
+    sleep 1
+    t=0    # wait for the new address to actually land on br-lan
+    while [ $t -lt 15 ]; do
+        ip -4 addr show br-lan 2>/dev/null | grep -q "inet $LAN_IP/" && break
+        sleep 1; t=$((t+1))
+    done
+fi
+
+ensure_nat_rule() {
+    iptables -t nat -C zone_wan_postrouting -d "$SUBNET" -j ACCEPT 2>/dev/null || \
+        iptables -t nat -I zone_wan_postrouting 1 -d "$SUBNET" -j ACCEPT 2>/dev/null
+}
+
+relaunch() {
+    killall relayd 2>/dev/null
+    sleep 1
+    ( /usr/sbin/relayd -I br-lan -I "$STA_IF" -L "$RELAY_IP" -B -D > /tmp/relayd.log 2>&1 & )
+    echo "$(date) relayd on $STA_IF -L $RELAY_IP ($1)" >> "$TRACE"
+    /usr/bin/opal-led bridge-ok
+}
+
+sleep 2
+ensure_nat_rule
+relaunch "immediate"
+
+# NAT-rule guard, 3 min (fw3 reloads erase the rule)
+( i=0; while [ $i -lt 18 ]; do sleep 10
+    [ "$(cat /tmp/relayd.lastevent 2>/dev/null)" = "$STAMP" ] || exit 0
+    ensure_nat_rule; i=$((i+1)); done ) </dev/null >/dev/null 2>&1 &
+
+# relayd safety retry at +2 min, self-cancelled by any newer ifup
+( sleep 120
+  [ "$(cat /tmp/relayd.lastevent 2>/dev/null)" = "$STAMP" ] || exit 0
+  ip addr show "$STA_IF" 2>/dev/null | grep -q "inet " || exit 0
+  relaunch "retry-1" ) </dev/null >/dev/null 2>&1 &

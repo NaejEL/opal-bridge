@@ -1,0 +1,22 @@
+#!/bin/sh
+# opal-led - LED state language of the dual-personality Opal.
+#   off               unknown / boot / transition entry
+#   bridge-converging blue blinking   (V2 discovering subnet, picking IPs)
+#   bridge-ok         blue solid      (relayd up, NAT exemption in place)
+#   router-transition white blinking  (hot switch to router in progress)
+#   router-ok         white solid     (stock router personality up)
+#   error             blue/white alternating fast (convergence failed)
+# SFT1200 LED = I2C controller at 0x30, driven via GL's gl_i2c_led.
+# The stock gl_led daemon rewrites the LED every 2s from kmwan status and is
+# permanently disabled by the package (postinst), like the relayd managers.
+# https://github.com/NaejEL/opal-bridge
+
+case "$1" in
+    off)               gl_i2c_led off >/dev/null 2>&1 ;;
+    bridge-converging) gl_i2c_led blue_flash medium >/dev/null 2>&1 ;;
+    bridge-ok)         gl_i2c_led blue >/dev/null 2>&1 ;;
+    router-transition) gl_i2c_led white_flash medium >/dev/null 2>&1 ;;
+    router-ok)         gl_i2c_led white >/dev/null 2>&1 ;;
+    error)             gl_i2c_led both_flash fast >/dev/null 2>&1 ;;
+    *) echo "usage: opal-led {off|bridge-converging|bridge-ok|router-transition|router-ok|error}" >&2; exit 1 ;;
+esac

@@ -1,0 +1,191 @@
+#!/bin/sh
+# opal-mode {bridge|router|status|apply-boot} - mode state machine.
+# Physical slide switch: hi = BRIDGE, lo = ROUTER (GPIO 1, label "switch").
+# Transitions are HOT by default; --reboot forces a reboot instead.
+# Hot-switch caveat (verified 2026-07-25): no PHY-bounce mechanism exists on
+# the sfax8 eswitch (eth0 admin state and 'swconfig set reset' are no-ops for
+# port PHYs), so wired clients keep their DHCP lease until renew/replug.
+# https://github.com/NaejEL/opal-bridge
+
+MODE_DIR=/etc/opal-mode
+CUR_FILE=$MODE_DIR/current
+ROUTER_SET=$MODE_DIR/router
+BOOT_DONE=/tmp/opal-mode.boot-done
+
+log() { logger -t opal-mode "$1"; echo "opal-mode: $1"; }
+
+gpio_mode() {   # echoes bridge|router|unknown from the slide switch
+    [ -e /sys/kernel/debug/gpio ] || mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+    line=$(grep '|switch' /sys/kernel/debug/gpio 2>/dev/null)
+    # the line carries TRAILING SPACES after hi/lo (verified on device), so
+    # anchor on the surrounding spaces, never on end-of-string
+    case "$line" in
+        *" hi"*) echo bridge ;;
+        *" lo"*) echo router ;;
+        *)       echo unknown ;;
+    esac
+}
+
+# empty output = uninitialized (fresh install); 99-relayd-bridge's gate only
+# stands down on an explicit "router", so uninitialized behaves as bridge
+current_mode() { cat "$CUR_FILE" 2>/dev/null; }
+
+apply_bridge() {
+    # leaving router mode: refresh the stock snapshot so later user changes
+    # made in router mode survive the round-trip (never refresh from a
+    # bridge-mutated config)
+    if [ "$(current_mode)" = "router" ]; then
+        mkdir -p "$ROUTER_SET"
+        cp /etc/config/network "$ROUTER_SET/network" && \
+        cp /etc/config/dhcp "$ROUTER_SET/dhcp" || \
+            log "WARN: could not refresh router snapshot, keeping previous one"
+    fi
+    uci -q get dhcp.lan >/dev/null || uci set dhcp.lan=dhcp
+    if ! uci set dhcp.lan.ignore='1' || ! uci commit dhcp; then
+        log "ERROR: cannot set dhcp.lan.ignore, mode unchanged"
+        return 1
+    fi
+    mkdir -p "$MODE_DIR"
+    echo bridge > "$CUR_FILE"
+    log "bridge mode applied (lan addressing owned by 99-relayd-bridge)"
+}
+
+hot_bridge() {
+    /usr/bin/opal-led bridge-converging
+    /etc/init.d/dnsmasq reload >/dev/null 2>&1
+    # the validated hotplug path does the rest (subnet discovery, lan
+    # re-address, relayd, NAT exemption)
+    ifup wwan >/dev/null 2>&1
+    log "hot: wwan bounced, 99-relayd-bridge will converge (~30-60s)"
+}
+
+apply_router() {
+    # stock lan values come from the captured snapshot - no hardcoded IPs
+    STOCK_IP=$(uci -c "$ROUTER_SET" -q get network.lan.ipaddr)
+    STOCK_MASK=$(uci -c "$ROUTER_SET" -q get network.lan.netmask)
+    if [ -z "$STOCK_IP" ]; then
+        log "ERROR: no captured router config in $ROUTER_SET, refusing"
+        return 1
+    fi
+    prev=$(current_mode)
+    # close the 99-relayd-bridge entry gate FIRST, then cancel its pending
+    # guard/retry subshells (they self-cancel on a stamp mismatch)
+    mkdir -p "$MODE_DIR"
+    echo router > "$CUR_FILE"
+    echo "mode-switch.$$" > /tmp/relayd.lastevent
+    killall relayd 2>/dev/null
+    if ! uci set network.lan.ipaddr="$STOCK_IP" || \
+       ! { [ -z "$STOCK_MASK" ] || uci set network.lan.netmask="$STOCK_MASK"; } || \
+       ! uci commit network || \
+       ! { uci -q delete dhcp.lan.ignore; uci commit dhcp; }; then
+        log "ERROR: uci restore failed, reverting mode marker"
+        if [ -n "$prev" ]; then echo "$prev" > "$CUR_FILE"; else rm -f "$CUR_FILE"; fi
+        return 1
+    fi
+    log "router mode applied (lan $STOCK_IP, dhcp.lan back on)"
+}
+
+hot_router() {
+    /usr/bin/opal-led router-transition
+    SUBNET=$(sed -n 's/^SUBNET=//p' "$MODE_DIR/bridge-state" 2>/dev/null)
+    # netifd only re-reads committed config on reload (verified on device)
+    ubus call network reload 2>/dev/null
+    sleep 2
+    /etc/init.d/dnsmasq reload >/dev/null 2>&1
+    [ -n "$SUBNET" ] && while iptables -t nat -D zone_wan_postrouting -d "$SUBNET" -j ACCEPT 2>/dev/null; do :; done
+    # janitor: a 99-relayd-bridge run already past its entry gate can finish
+    # behind us (arping scan takes tens of seconds) - sweep once more
+    ( sleep 25
+      [ "$(cat "$CUR_FILE" 2>/dev/null)" = "router" ] || exit 0
+      killall relayd 2>/dev/null
+      [ -n "$SUBNET" ] && while iptables -t nat -D zone_wan_postrouting -d "$SUBNET" -j ACCEPT 2>/dev/null; do :; done
+      SIP=$(uci -c "$ROUTER_SET" -q get network.lan.ipaddr)
+      if [ -n "$SIP" ] && [ "$(uci -q get network.lan.ipaddr)" != "$SIP" ]; then
+          uci set network.lan.ipaddr="$SIP"
+          uci commit network
+          ubus call network reload 2>/dev/null
+      fi
+    ) </dev/null >/dev/null 2>&1 &
+    /usr/bin/opal-led router-ok
+    log "hot: lan back to stock, dnsmasq serving, janitor armed (+25s)"
+}
+
+set_mode() {   # $1 = bridge|router ; $2 = --reboot
+    want=$1
+    cur=$(current_mode)
+    # a missing state file means uninitialized: never short-circuit then
+    if [ "$cur" = "$want" ] && [ -f "$CUR_FILE" ]; then
+        log "already in $want mode, nothing to do"
+        return 0
+    fi
+    apply_$want || return 1
+    if [ "$2" = "--reboot" ]; then
+        log "mode changed to $want, rebooting"
+        reboot
+        return 0
+    fi
+    hot_$want
+    log "hot switch to $want done; wired clients keep their old lease until renew/replug"
+}
+
+apply_boot() {   # init.d path, START=15: BEFORE dnsmasq(19)/network(20)
+    gpio=$(gpio_mode)
+    cur=$(current_mode)
+    if [ "$gpio" = "unknown" ]; then
+        log "boot: cannot read switch GPIO, keeping mode '${cur:-bridge}'"
+    elif [ "$gpio" != "$cur" ] || [ ! -f "$CUR_FILE" ]; then
+        log "boot: switch=$gpio current='${cur:-unset}' -> applying $gpio"
+        # on failure the apply_* marker handling leaves a coherent mode
+        apply_$gpio || log "ERROR: applying $gpio at boot failed, staying in '${cur:-bridge}'"
+    fi
+    # LED language: bridge waits for convergence (off), router is up once
+    # its config is applied pre-network
+    case "$(current_mode)" in
+        router) /usr/bin/opal-led router-ok ;;
+        *)      /usr/bin/opal-led off ;;
+    esac
+}
+
+status() {
+    cur=$(current_mode)
+    gpio=$(gpio_mode)
+    echo "mode    : ${cur:-bridge (uninitialized)} (switch: $gpio)"
+    if [ -f "$CUR_FILE" ] && [ "$gpio" != "$cur" ] && [ "$gpio" != "unknown" ]; then
+        echo "warning : switch position differs -> will flip to $gpio on next boot"
+    fi
+    if [ "$cur" = "router" ] && ps | grep '[r]elayd -I' >/dev/null; then
+        echo "warning : relayd still running from bridge mode (hot switch pending or failed)"
+    fi
+    if [ "$cur" != "router" ] && [ -f "$MODE_DIR/bridge-state" ]; then
+        . "$MODE_DIR/bridge-state"
+        echo "subnet  : $SUBNET"
+        echo "lan ip  : $LAN_IP   relay ip : $RELAY_IP"
+        if ps | grep '[r]elayd -I' >/dev/null; then
+            echo "relayd  : running"
+        else
+            echo "relayd  : NOT running"
+        fi
+        if iptables -t nat -C zone_wan_postrouting -d "$SUBNET" -j ACCEPT 2>/dev/null; then
+            echo "nat     : hairpin exemption present"
+        else
+            echo "nat     : exemption MISSING (guard restores it within 10s of ifup)"
+        fi
+    fi
+}
+
+case "$1" in
+    bridge|router|apply-boot)
+        # serialize all mode mutations; NEVER reuse gl-switch.lock here:
+        # bridgemode.sh already runs under it (deadlock)
+        mkdir -p /var/lock
+        exec 9>/var/lock/opal-mode.lock
+        flock 9 || { log "ERROR: cannot take opal-mode lock"; exit 1; }
+        ;;
+esac
+
+case "$1" in
+    bridge|router) set_mode "$1" "$2" ;;
+    status|"")     status ;;
+    apply-boot)    apply_boot; touch "$BOOT_DONE" ;;
+    *) echo "usage: opal-mode {bridge|router|status|apply-boot} [--reboot]" >&2; exit 1 ;;
+esac

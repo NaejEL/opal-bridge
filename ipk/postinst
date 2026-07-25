@@ -1,0 +1,43 @@
+#!/bin/sh
+# opal-bridge postinst - all steps idempotent (safe on reinstall/upgrade)
+[ -n "$IPKG_INSTROOT" ] && exit 0
+log() { logger -t opal-bridge "$1"; echo "opal-bridge: $1"; }
+
+# 1. capture the stock router config ONCE (install happens on a stock device;
+#    later refreshes are done by opal-mode when leaving router mode)
+if [ ! -f /etc/opal-mode/router/network ]; then
+    mkdir -p /etc/opal-mode/router
+    cp /etc/config/network /etc/opal-mode/router/network
+    cp /etc/config/dhcp    /etc/opal-mode/router/dhcp
+    cp /etc/config/firewall /etc/opal-mode/router/firewall
+    log "stock router config captured"
+fi
+
+# 2. neutralize the concurrent relayd managers (they fight 99-relayd-bridge)
+if [ -x /etc/init.d/relayd ]; then
+    /etc/init.d/relayd disable 2>/dev/null
+    /etc/init.d/relayd stop 2>/dev/null
+fi
+[ -f /etc/hotplug.d/iface/30-relay ] && mv /etc/hotplug.d/iface/30-relay /root/30-relay.bak
+
+# 3. take LED ownership (stock daemon rewrites the LED every 2s)
+if [ -x /etc/init.d/gl_led ]; then
+    /etc/init.d/gl_led disable 2>/dev/null
+    /etc/init.d/gl_led stop 2>/dev/null
+fi
+
+# 4. wire the physical slide switch to the mode machine
+uci set switch-button.@main[0].func='bridgemode'
+uci commit switch-button
+
+# 5. mDNS opal.local - NOTE: opkg cannot be called from a postinst (the
+#    install lock is held), so avahi is detected on the filesystem and the
+#    setup script tells the user what to run if it is missing
+/usr/lib/opal-bridge/setup-mdns
+
+# 6. boot-time switch read (S15, before dnsmasq/network)
+/etc/init.d/opal-mode enable
+
+log "installed. Set the slide switch (hi = BRIDGE, lo = ROUTER) and REBOOT to"
+log "activate; after that the switch also hot-toggles the mode while running."
+exit 0

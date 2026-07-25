@@ -1,0 +1,12 @@
+Package: opal-bridge
+Version: 0.1.0-1
+Architecture: all
+Maintainer: Jean LE QUELLEC <jean.le.quellec@gmail.com>
+Section: net
+Priority: optional
+Depends: relayd
+Description: Dual-personality GL-SFT1200 (Opal): true L2 WiFi-to-Ethernet
+ bridge (BRIDGE) or untouched stock GL.iNet router (ROUTER), selected by the
+ physical slide switch - read at boot, hot-toggled while running. Dynamic
+ subnet discovery, zero hardcoded IPs, opal.local mDNS alias, LED state
+ language. hi = BRIDGE, lo = ROUTER.
