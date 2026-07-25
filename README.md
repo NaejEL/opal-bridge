@@ -22,6 +22,12 @@ The physical slide switch selects the mode: it is read **at boot**, and flipping
 
 ## Install
 
+On a fresh/stock Opal, first do the usual initial setup: browse to
+`http://192.168.8.1`, set the admin password, and join your upstream WiFi from
+the **Repeater** page (the install needs Internet access). Then — SSH is not
+usable out of the box — go to **System → Advanced Settings** and install
+**LuCI**; from that point on SSH and scp accept `root` + your admin password.
+
 1. Download `opal-bridge_<version>_all.ipk` from [Releases](../../releases).
 2. Copy it to the Opal and install (from a machine on the Opal's network — stock address is `192.168.8.1`):
 
@@ -76,6 +82,8 @@ nat     : hairpin exemption present
 | LED alternating blue/white | No free IPs found on the upstream subnet (or subnet too small). Check the upstream network, then `ifdown wwan; ifup wwan` or reboot. |
 | Wired client stuck with an old address after a mode flip | Expected — replug the cable or renew the lease. |
 | `opal.local` not resolving on one PC while other devices resolve it | Local resolver issue on that PC (VPN LAN-discovery settings, stale mDNS cache) — the Opal side answers fine. Use the IP meanwhile. |
+| `console.gl-inet.com` unreachable in bridge mode | Expected: that name only exists when the Opal is your DNS server (router mode). In bridge mode use `http://opal.local` or the IP — LuCI is at `http://<ip>/cgi-bin/luci`. |
+| "Bad Gateway" from the web UI right after a mode change | Services are still settling during convergence. Wait for the solid LED, then reload. |
 | Bridge briefly loses 1–2 pings right after boot or an uplink change | relayd warm-up while it relearns hosts; settles within seconds. |
 | Everything broken, want stock back | `opkg remove opal-bridge` — restores the stock configuration and services. |
 
