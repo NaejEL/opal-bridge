@@ -181,6 +181,16 @@ relayd unnecessary (the sta joins br-lan directly). Probed on device
   4addr clients (OpenWrt `option wds '1'`); ISP boxes don't. ESP32 SoftAP
   can't either (no WDS in ESP-IDF) — an ESP32 in promiscuous mode could at
   least verify 4-address frame emission.
+- The vendor `mac80211.sh` fully supports the standard OpenWrt `wds` option
+  on both sides (sta → VIF created with `4addr on`; AP → `wds_sta=1` in
+  hostapd), and the declared interface combinations allow two STA VIFs per
+  phy. Planned "WDS auto-mode": silently probe an unknown AP on a second STA
+  VIF (4addr, throwaway bridge with a random MAC + DHCP — a lease proves the
+  AP forwards foreign-MAC frames), cache the verdict per BSSID (SSID
+  inheritance for band switches), then either enslave the sta into br-lan
+  via `wds=1` + `network=lan` (no relayd, no NAT rule) or keep the relayd
+  path. 4addr support is not advertised in beacons; empirical probing is the
+  only detection that exists.
 
 ## 9. Test protocol (what "works" means)
 
