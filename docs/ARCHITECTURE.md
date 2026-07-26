@@ -158,7 +158,31 @@ verified by installing over a hand-configured device.
 - Serial: 3.3 V UART pads, 115200 8N1. U-Boot TFTP recovery: hold reset at boot,
   `192.168.1.1`.
 
-## 8. Test protocol (what "works" means)
+## 8. MAC transparency and the 4addr investigation
+
+relayd rewrites L2: every frame on the WiFi link carries the Opal's MAC
+(802.11 3-address rule — a client cannot transmit foreign source MACs), while
+the DHCP relay preserves `chaddr`, which is why per-client leases and MAC
+reservations on the upstream router keep working. The upstream's device list
+lumping everything under one MAC is cosmetic and structural, not fixable
+within relayd.
+
+True MAC passthrough = 4addr (modern WDS) on both ends, which would also make
+relayd unnecessary (the sta joins br-lan directly). Probed on device
+(2026-07-26):
+
+- `/proc/gl-hw-info/nowds` = 1 — GL hides their WDS mode on this hardware.
+- `iw phy`: managed / AP / **AP-VLAN** / monitor / P2P (AP-VLAN = the 4addr-AP
+  plumbing exists in the stack); legacy `wds` iface type → `Not supported`.
+- Creating a **managed VIF with `4addr on` succeeds on both radios** — more
+  promising than GL's flag suggests. `set 4addr on` on the live sta returns
+  EBUSY (interface must be down/fresh, and gl-repeater owns it).
+- Untested beyond that: association and data path need an AP that accepts
+  4addr clients (OpenWrt `option wds '1'`); ISP boxes don't. ESP32 SoftAP
+  can't either (no WDS in ESP-IDF) — an ESP32 in promiscuous mode could at
+  least verify 4-address frame emission.
+
+## 9. Test protocol (what "works" means)
 
 Single ping from a wired client to the upstream gateway — **never two pings in
 parallel** (Windows shares one sequence counter across targets; interleaved

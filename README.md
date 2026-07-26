@@ -87,6 +87,12 @@ nat     : hairpin exemption present
 | Bridge briefly loses 1–2 pings right after boot or an uplink change | relayd warm-up while it relearns hosts; settles within seconds. |
 | Everything broken, want stock back | `opkg remove opal-bridge` — restores the stock configuration and services. |
 
+## What it is — and isn't
+
+- **IP-transparent L2 bridge**: wired clients get DHCP from the upstream router, live in its subnet, receive broadcast/mDNS. That's what the stock firmware cannot do.
+- **Not MAC-transparent**: like every non-WDS WiFi bridge, all traffic crosses the WiFi link with the Opal's own MAC — standard 802.11 does not let a client transmit frames with another device's source MAC. Consequence: your main router's device list shows one device (the Opal) holding several IPs. Per-client DHCP leases and **MAC reservations on the main router still work** — the real client MAC travels inside the DHCP payload.
+- True MAC passthrough would require 4-address (WDS) support on **both** ends. The Opal side looks feasible (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)); ISP boxes don't cooperate, so if it lands it will be an optional mode for OpenWrt-uplink setups.
+
 ## Under the hood
 
 Technical documentation lives in [`docs/`](docs/):
