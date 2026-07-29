@@ -112,9 +112,11 @@ relaunch "immediate"
   ip addr show "$STA_IF" 2>/dev/null | grep -q "inet " || exit 0
   relaunch "retry-1" ) </dev/null >/dev/null 2>&1 &
 
-# NOTE: the automatic WDS probe was removed after the 4addr investigation
-# concluded (2026-07-29): the Siflower firmware accepts 4addr and bridges
-# for ~60-120s, then its peer state collapses and 4addr ACTIVITY WEDGES THE
-# MAIN STA's data path on the shared radio. GL's nowds=1 is justified.
-# /usr/lib/opal-bridge/wds-probe remains as a MANUAL diagnostic
-# (opal-mode wds-reprobe) - see docs/ARCHITECTURE.md.
+# NOTE: no automatic WDS probe here. 4addr WORKS on this hardware (verified
+# end-to-end 2026-07-29, real MACs crossing) but ONLY with exclusive radio
+# ownership: gl-repeater's supplicant must be fully stopped first - a
+# leftover supplicant kills the 4addr data path within ~2 minutes (this
+# masqueraded as a firmware failure for a whole evening). The future wds
+# mode owns that orchestration explicitly; probing casually from hotplug
+# while gl-repeater runs is exactly the wrong way to do it.
+# /usr/lib/opal-bridge/wds-probe = MANUAL diagnostic (opal-mode wds-reprobe).

@@ -187,26 +187,32 @@ relayd unnecessary (the sta joins br-lan directly). Probed on device
   phy. 4addr support is not advertised in beacons; empirical probing is the
   only detection that exists.
 
-**FINAL VERDICT (2026-07-29, tested end-to-end against an OpenWrt mt76 AP
-with `option wds '1'`) — dead end, do not revisit on this firmware:**
+**VERDICT (2026-07-29, tested end-to-end against an OpenWrt mt76 AP with
+`option wds '1'`) — 4addr WORKS, with one hard orchestration rule:**
 
-- Everything *starts* working: a manual 4addr sta (own wpa_supplicant, since
-  gl-repeater — not netifd — orchestrates the supplicant on this firmware
-  and rewrites `wireless.sta` on every cycle, discarding foreign options)
-  associates, the kernel accepts it into br-lan (only possible with 4addr),
-  and frames genuinely cross the pure L2 bridge.
-- Then, within ~60–120 s, the **firmware peer state collapses**: `station
-  dump` goes empty while mac80211 still reports the association; the data
-  path dies and does not recover. Reproduced three times. 4addr activity on
-  one VIF also wedges the *other* sta on the shared radio (recovery: wwan
-  bounce or reboot). `iw set power_save` is `Not supported`, so the classic
-  PS workaround cannot even be tested.
-- Conclusion: GL's `nowds=1` flag is honest — the closed WiFi firmware
-  cannot sustain 4addr. relayd stays the one true bridge path; the silent
-  probe was demoted to a manual diagnostic (`opal-mode wds-reprobe`) and
-  removed from the hotplug path (its own 4addr traffic is what wedges the
-  uplink). MAC transparency over a WiFi uplink is therefore structurally
-  out of reach on this device.
+- The full chain was proven live: manual 4addr sta + own wpa_supplicant →
+  association → kernel accepts the sta into br-lan (only possible with
+  4addr) → the AP creates its AP/VLAN → wired clients' **real MACs appear
+  in the AP-side bridge FDB**, ICMP and TCP cross, and the link survived
+  long idle periods (3+ min of radio silence) and sustained traffic alike.
+- The hard rule learned the expensive way: **the wds path must own the
+  radio exclusively.** gl-repeater — not netifd — orchestrates the sta
+  supplicant on this firmware, rewrites `wireless.sta` on every cycle
+  (discarding foreign options like `wds`), and a **leftover gl-repeater
+  supplicant kills the 4addr data path within ~2 minutes** (station dump
+  empties while the association is still reported). For one evening this
+  perfectly impersonated a firmware limitation — three "reproductions"
+  shared the same confounder. A clean `killall wpa_supplicant` before
+  building the 4addr session makes the problem vanish entirely.
+- GL's `nowds=1` therefore hides a working capability (their UI stack just
+  never orchestrates it). A future wds mode in opal-bridge = stop
+  gl-repeater, run our own supplicant on a 4addr sta enslaved in br-lan —
+  no relayd, no NAT rule, true MAC transparency. Roaming/reconnection
+  duties move to our supplicant (it handles reassociation natively).
+- Misc: `iw set power_save` is `Not supported` on the Siflower driver;
+  `station dump` output on the sta side shows garbage MACs (cosmetic);
+  the silent probe stays a manual diagnostic (`opal-mode wds-reprobe`) —
+  probing while gl-repeater runs is exactly the confounder above.
 
 ## 9. Test protocol (what "works" means)
 
