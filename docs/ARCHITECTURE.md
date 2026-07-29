@@ -184,13 +184,29 @@ relayd unnecessary (the sta joins br-lan directly). Probed on device
 - The vendor `mac80211.sh` fully supports the standard OpenWrt `wds` option
   on both sides (sta → VIF created with `4addr on`; AP → `wds_sta=1` in
   hostapd), and the declared interface combinations allow two STA VIFs per
-  phy. Planned "WDS auto-mode": silently probe an unknown AP on a second STA
-  VIF (4addr, throwaway bridge with a random MAC + DHCP — a lease proves the
-  AP forwards foreign-MAC frames), cache the verdict per BSSID (SSID
-  inheritance for band switches), then either enslave the sta into br-lan
-  via `wds=1` + `network=lan` (no relayd, no NAT rule) or keep the relayd
-  path. 4addr support is not advertised in beacons; empirical probing is the
+  phy. 4addr support is not advertised in beacons; empirical probing is the
   only detection that exists.
+
+**FINAL VERDICT (2026-07-29, tested end-to-end against an OpenWrt mt76 AP
+with `option wds '1'`) — dead end, do not revisit on this firmware:**
+
+- Everything *starts* working: a manual 4addr sta (own wpa_supplicant, since
+  gl-repeater — not netifd — orchestrates the supplicant on this firmware
+  and rewrites `wireless.sta` on every cycle, discarding foreign options)
+  associates, the kernel accepts it into br-lan (only possible with 4addr),
+  and frames genuinely cross the pure L2 bridge.
+- Then, within ~60–120 s, the **firmware peer state collapses**: `station
+  dump` goes empty while mac80211 still reports the association; the data
+  path dies and does not recover. Reproduced three times. 4addr activity on
+  one VIF also wedges the *other* sta on the shared radio (recovery: wwan
+  bounce or reboot). `iw set power_save` is `Not supported`, so the classic
+  PS workaround cannot even be tested.
+- Conclusion: GL's `nowds=1` flag is honest — the closed WiFi firmware
+  cannot sustain 4addr. relayd stays the one true bridge path; the silent
+  probe was demoted to a manual diagnostic (`opal-mode wds-reprobe`) and
+  removed from the hotplug path (its own 4addr traffic is what wedges the
+  uplink). MAC transparency over a WiFi uplink is therefore structurally
+  out of reach on this device.
 
 ## 9. Test protocol (what "works" means)
 

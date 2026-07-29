@@ -112,9 +112,9 @@ relaunch "immediate"
   ip addr show "$STA_IF" 2>/dev/null | grep -q "inet " || exit 0
   relaunch "retry-1" ) </dev/null >/dev/null 2>&1 &
 
-# silent WDS capability probe once the bridge has settled (no-op when the
-# BSSID verdict is already cached; verdict consumed by a future wds mode)
-( sleep 30
-  [ "$(cat /tmp/relayd.lastevent 2>/dev/null)" = "$STAMP" ] || exit 0
-  [ -x /usr/lib/opal-bridge/wds-probe ] && /usr/lib/opal-bridge/wds-probe
-) </dev/null >/dev/null 2>&1 &
+# NOTE: the automatic WDS probe was removed after the 4addr investigation
+# concluded (2026-07-29): the Siflower firmware accepts 4addr and bridges
+# for ~60-120s, then its peer state collapses and 4addr ACTIVITY WEDGES THE
+# MAIN STA's data path on the shared radio. GL's nowds=1 is justified.
+# /usr/lib/opal-bridge/wds-probe remains as a MANUAL diagnostic
+# (opal-mode wds-reprobe) - see docs/ARCHITECTURE.md.

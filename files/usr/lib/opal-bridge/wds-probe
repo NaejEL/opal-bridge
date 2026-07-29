@@ -7,6 +7,14 @@
 # Verdicts cached in /etc/opal-mode/wds-cache: "BSSID SSID verdict epoch".
 # Association failure is INCONCLUSIVE (not cached): only a dead data path
 # behind a successful association proves "no".
+#
+# ⚠ MANUAL DIAGNOSTIC ONLY (opal-mode wds-reprobe) - NOT hooked into the
+# hotplug path anymore. Verdict of the 4addr investigation (2026-07-29, on
+# device, against an OpenWrt mt76 AP with wds=1): the Siflower firmware
+# accepts 4addr, associates, bridges for ~60-120s, then its peer state
+# collapses AND the 4addr activity wedges the main sta on the shared radio
+# (recovery = wwan bounce or reboot). GL's nowds=1 flag is justified.
+# Do not re-arm automatic probing unless the WiFi firmware changes.
 # https://github.com/NaejEL/opal-bridge
 
 CACHE=/etc/opal-mode/wds-cache
