@@ -170,6 +170,12 @@ status() {
         else
             echo "nat     : exemption MISSING (guard restores it within 10s of ifup)"
         fi
+        STA=$(ip -4 addr show 2>/dev/null | awk '/^[0-9]+: /{i=""; if ($2 ~ /^sta/) {i=$2; sub(":$","",i)}} /inet /{if (i!="") {print i; exit}}')
+        if [ -n "$STA" ]; then
+            B=$(iw dev "$STA" link 2>/dev/null | sed -n 's/^Connected to \([0-9a-f:]*\).*/\1/p')
+            W=$(awk -v b="$B" '$1==b {print $3}' "$MODE_DIR/wds-cache" 2>/dev/null | tail -1)
+            echo "wds     : ${W:-unknown} (upstream $B)"
+        fi
     fi
 }
 
@@ -187,5 +193,15 @@ case "$1" in
     bridge|router) set_mode "$1" "$2" ;;
     status|"")     status ;;
     apply-boot)    apply_boot; touch "$BOOT_DONE" ;;
-    *) echo "usage: opal-mode {bridge|router|status|apply-boot} [--reboot]" >&2; exit 1 ;;
+    wds-reprobe)
+        # forget the current upstream's verdict and probe again, foreground
+        STA=$(ip -4 addr show 2>/dev/null | awk '/^[0-9]+: /{i=""; if ($2 ~ /^sta/) {i=$2; sub(":$","",i)}} /inet /{if (i!="") {print i; exit}}')
+        B=$(iw dev "$STA" link 2>/dev/null | sed -n 's/^Connected to \([0-9a-f:]*\).*/\1/p')
+        if [ -n "$B" ] && [ -f "$MODE_DIR/wds-cache" ]; then
+            grep -v "^$B " "$MODE_DIR/wds-cache" > "$MODE_DIR/wds-cache.tmp" 2>/dev/null
+            mv "$MODE_DIR/wds-cache.tmp" "$MODE_DIR/wds-cache"
+        fi
+        exec /usr/lib/opal-bridge/wds-probe
+        ;;
+    *) echo "usage: opal-mode {bridge|router|status|apply-boot|wds-reprobe} [--reboot]" >&2; exit 1 ;;
 esac

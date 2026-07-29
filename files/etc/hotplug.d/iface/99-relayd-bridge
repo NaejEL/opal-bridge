@@ -111,3 +111,10 @@ relaunch "immediate"
   [ "$(cat /tmp/relayd.lastevent 2>/dev/null)" = "$STAMP" ] || exit 0
   ip addr show "$STA_IF" 2>/dev/null | grep -q "inet " || exit 0
   relaunch "retry-1" ) </dev/null >/dev/null 2>&1 &
+
+# silent WDS capability probe once the bridge has settled (no-op when the
+# BSSID verdict is already cached; verdict consumed by a future wds mode)
+( sleep 30
+  [ "$(cat /tmp/relayd.lastevent 2>/dev/null)" = "$STAMP" ] || exit 0
+  [ -x /usr/lib/opal-bridge/wds-probe ] && /usr/lib/opal-bridge/wds-probe
+) </dev/null >/dev/null 2>&1 &

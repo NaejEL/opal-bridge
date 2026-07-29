@@ -1,0 +1,105 @@
+#!/bin/sh
+# opal-bridge: silent 4addr (WDS) capability probe of the current upstream AP.
+# Runs a SECOND sta VIF next to the active one (driver allows 2 STA per phy),
+# associates to the same BSSID, then tries DHCP from a throwaway bridge with
+# a foreign MAC: a lease proves the AP forwards foreign-MAC frames = 4addr
+# works. The running relayd bridge is never touched.
+# Verdicts cached in /etc/opal-mode/wds-cache: "BSSID SSID verdict epoch".
+# Association failure is INCONCLUSIVE (not cached): only a dead data path
+# behind a successful association proves "no".
+# https://github.com/NaejEL/opal-bridge
+
+CACHE=/etc/opal-mode/wds-cache
+LOCK=/var/lock/wds-probe.lock
+VIF=wdsprobe
+BRP=br-probe
+CONF=/tmp/wdsprobe.conf
+PIDF=/tmp/wdsprobe.pid
+
+log() { logger -t opal-wds "$1"; echo "opal-wds: $1"; }
+
+teardown() {
+    [ -f "$PIDF" ] && kill "$(cat "$PIDF")" 2>/dev/null
+    ip link set "$BRP" down 2>/dev/null
+    brctl delif "$BRP" "$VIF" 2>/dev/null
+    brctl delbr "$BRP" 2>/dev/null
+    iw dev "$VIF" del 2>/dev/null
+    rm -f "$CONF" "$PIDF"
+    rmdir "$LOCK" 2>/dev/null
+}
+
+mkdir "$LOCK" 2>/dev/null || exit 0     # another probe is running
+trap teardown EXIT INT TERM
+
+# ---- identify the active uplink ----
+STA_IF=$(ip -4 addr show 2>/dev/null | awk '/^[0-9]+: /{i=""; if ($2 ~ /^sta/) {i=$2; sub(":$","",i)}} /inet /{if (i!="") {print i; exit}}')
+[ -z "$STA_IF" ] && exit 0
+BSSID=$(iw dev "$STA_IF" link 2>/dev/null | sed -n 's/^Connected to \([0-9a-f:]*\).*/\1/p')
+[ -z "$BSSID" ] && exit 0
+SSID=$(uci -q get wireless.sta.ssid)
+KEY=$(uci -q get wireless.sta.key)
+ENC=$(uci -q get wireless.sta.encryption)
+PHY="phy$(iw dev "$STA_IF" info 2>/dev/null | sed -n 's/.*wiphy \([0-9]*\).*/\1/p')"
+[ "$PHY" = "phy" ] && exit 0
+
+# ---- cache lookup: exact BSSID, then SSID inheritance ----
+if [ -f "$CACHE" ]; then
+    V=$(awk -v b="$BSSID" '$1==b {print $3}' "$CACHE" | tail -1)
+    [ -n "$V" ] && { log "cache: $BSSID -> $V (skip probe)"; exit 0; }
+    V=$(awk -v s="$SSID" '$2==s {print $3}' "$CACHE" | tail -1)
+    [ -n "$V" ] && {
+        log "cache: inherited '$SSID' -> $V for $BSSID"
+        printf '%s %s %s %s\n' "$BSSID" "$SSID" "$V" "$(date +%s)" >> "$CACHE"
+        exit 0
+    }
+fi
+
+# only WPA2-PSK uplinks are probed for now (matches gl-repeater usage)
+case "$ENC" in psk2*|psk*) ;; *) log "encryption '$ENC' not supported by probe"; exit 0 ;; esac
+[ -z "$SSID" ] || [ -z "$KEY" ] && exit 0
+
+log "probing $SSID ($BSSID) for 4addr on $PHY"
+
+# ---- deterministic locally-administered MACs (distinct from real ones) ----
+SUFFIX=$(cat /sys/class/net/br-lan/address | cut -d: -f4-6)
+VIF_MAC="06:4f:70:$SUFFIX"
+BRP_MAC="0a:4f:70:$SUFFIX"
+
+# ---- second sta VIF in 4addr mode ----
+iw phy "$PHY" interface add "$VIF" type managed 4addr on 2>/dev/null || {
+    log "VIF creation failed (driver refused): inconclusive"; exit 0; }
+ip link set "$VIF" address "$VIF_MAC" 2>/dev/null
+
+# ---- minimal supplicant pinned to the same BSSID ----
+printf 'ctrl_interface=/var/run/wpa_supplicant-probe\nnetwork={\n\tssid="%s"\n\tbssid=%s\n\tpsk="%s"\n\tkey_mgmt=WPA-PSK\n}\n' \
+    "$SSID" "$BSSID" "$KEY" > "$CONF"
+wpa_supplicant -B -i "$VIF" -c "$CONF" -P "$PIDF" >/dev/null 2>&1 || {
+    log "supplicant failed to start: inconclusive"; exit 0; }
+
+t=0
+while [ $t -lt 20 ]; do
+    iw dev "$VIF" link 2>/dev/null | grep -q '^Connected to' && break
+    sleep 1; t=$((t+1))
+done
+if ! iw dev "$VIF" link 2>/dev/null | grep -q '^Connected to'; then
+    log "no association within 20s: INCONCLUSIVE (not cached)"
+    exit 0
+fi
+
+# ---- the definitive test: DHCP from a foreign MAC through the 4addr link ----
+brctl addbr "$BRP" 2>/dev/null
+brctl addif "$BRP" "$VIF" 2>/dev/null
+ip link set "$BRP" address "$BRP_MAC" 2>/dev/null
+ip link set "$BRP" up 2>/dev/null
+ip link set "$VIF" up 2>/dev/null
+
+if udhcpc -i "$BRP" -n -q -t 4 -T 3 -s /bin/true >/dev/null 2>&1; then
+    VERDICT=yes
+else
+    VERDICT=no
+fi
+
+mkdir -p /etc/opal-mode
+printf '%s %s %s %s\n' "$BSSID" "$SSID" "$VERDICT" "$(date +%s)" >> "$CACHE"
+tail -50 "$CACHE" > "$CACHE.tmp" && mv "$CACHE.tmp" "$CACHE"
+log "verdict: $SSID ($BSSID) 4addr=$VERDICT (cached)"
