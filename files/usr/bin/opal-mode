@@ -60,6 +60,8 @@ hot_bridge() {
 }
 
 apply_router() {
+    # an active wds session must release the radio before going router
+    [ -f /var/run/opal-wds/state ] && /usr/lib/opal-bridge/opal-wds stop
     # stock lan values come from the captured snapshot - no hardcoded IPs
     STOCK_IP=$(uci -c "$ROUTER_SET" -q get network.lan.ipaddr)
     STOCK_MASK=$(uci -c "$ROUTER_SET" -q get network.lan.netmask)
@@ -160,6 +162,10 @@ status() {
         . "$MODE_DIR/bridge-state"
         echo "subnet  : $SUBNET"
         echo "lan ip  : $LAN_IP   relay ip : $RELAY_IP"
+        if [ -f /var/run/opal-wds/state ]; then
+            /usr/lib/opal-bridge/opal-wds status
+            return
+        fi
         if ps | grep '[r]elayd -I' >/dev/null; then
             echo "relayd  : running"
         else
@@ -193,6 +199,11 @@ case "$1" in
     bridge|router) set_mode "$1" "$2" ;;
     status|"")     status ;;
     apply-boot)    apply_boot; touch "$BOOT_DONE" ;;
+    wds-try)
+        # supervised trial of a REAL wds session on the current network
+        # (~30-60s of disruption; verdict cached; falls back to relayd)
+        exec /usr/lib/opal-bridge/opal-wds start --force
+        ;;
     wds-reprobe)
         # forget the current upstream's verdict and probe again, foreground
         STA=$(ip -4 addr show 2>/dev/null | awk '/^[0-9]+: /{i=""; if ($2 ~ /^sta/) {i=$2; sub(":$","",i)}} /inet /{if (i!="") {print i; exit}}')

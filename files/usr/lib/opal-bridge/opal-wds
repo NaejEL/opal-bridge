@@ -1,0 +1,257 @@
+#!/bin/sh
+# opal-wds {start [--force]|stop|status|monitor} - true 4addr (WDS) bridge
+# engine. Takes EXCLUSIVE radio ownership (gl-repeater stopped, its
+# supplicant killed - a leftover supplicant kills the 4addr path in ~2min),
+# builds a 4addr sta enslaved in br-lan (no relayd, no NAT rule), monitors
+# the link and re-evaluates the band on the idle radio. Falls back to the
+# relayd path (gl-repeater restarted) on failure, with a retry cooldown.
+# Entered from 99-relayd-bridge's handover when the BSSID is cached "yes"
+# (or manually via 'opal-mode wds-try' = start --force).
+# https://github.com/NaejEL/opal-bridge
+
+RUN=/var/run/opal-wds
+CACHE=/etc/opal-mode/wds-cache
+STATEF=$RUN/state
+CONF=$RUN/supplicant.conf
+PIDF=$RUN/supplicant.pid
+MONPIDF=$RUN/monitor.pid
+CTRL=$RUN/ctrl
+COOLDOWN=/tmp/opal-wds.cooldown
+VIF=wds0
+
+log() { logger -t opal-wds "$1"; echo "opal-wds: $1"; }
+
+# ---- selected network from gl-repeater's own store ----
+read_network() {
+    IDX=$(uci show repeater 2>/dev/null | sed -n "s/^repeater\.@network\[\([0-9]*\)\]\.selected='1'.*/\1/p" | head -1)
+    [ -z "$IDX" ] && return 1
+    SSID=$(uci -q get "repeater.@network[$IDX].ssid")
+    KEY=$(uci -q get "repeater.@network[$IDX].key")
+    MAC=$(uci -q get "repeater.@network[$IDX].macaddr" | sed 's/^r,//')
+    [ -n "$SSID" ] && [ -n "$KEY" ]
+}
+
+# ---- best BSS of $2 on phy $1 -> "BSSID SIGNAL" (echo), rc 1 if absent ----
+scan_best() {
+    iw dev wdsscan del 2>/dev/null
+    iw phy "$1" interface add wdsscan type managed >/dev/null 2>&1 || return 1
+    ip link set wdsscan up 2>/dev/null
+    OUT=$(iw dev wdsscan scan 2>/dev/null)
+    [ -z "$OUT" ] && { sleep 2; OUT=$(iw dev wdsscan scan 2>/dev/null); }
+    iw dev wdsscan del 2>/dev/null
+    echo "$OUT" | awk -v ss="$SSID" '
+        /^BSS /    { b=substr($2,1,17) }
+        /signal:/  { s=$2 }
+        /SSID: /   { n=$0; sub(/.*SSID: /,"",n);
+                     if (n==ss && s+0 > best) { best=s+0; bb=b; f=1 } }
+        BEGIN      { best=-999 }
+        END        { if (f) printf "%s %d\n", bb, best; else exit 1 }'
+}
+
+# ---- pick band: 5GHz (phy1) first if decent, else 2.4 (phy0) ----
+pick_band() {
+    R5=$(scan_best phy1) && S5=${R5##* } || S5=-999
+    if [ "$S5" -ge -70 ]; then PHY=phy1; BSSID=${R5%% *}; SIG=$S5; return 0; fi
+    R2=$(scan_best phy0) && S2=${R2##* } || S2=-999
+    if [ "$S2" -gt -999 ]; then PHY=phy0; BSSID=${R2%% *}; SIG=$S2; return 0; fi
+    if [ "$S5" -gt -999 ]; then PHY=phy1; BSSID=${R5%% *}; SIG=$S5; return 0; fi
+    return 1
+}
+
+own_radio() {   # exclusive ownership - THE hard rule
+    /etc/init.d/repeater stop 2>/dev/null
+    killall gl-repeater 2>/dev/null
+    killall wpa_supplicant 2>/dev/null
+    killall relayd 2>/dev/null
+    echo "wds.$$" > /tmp/relayd.lastevent
+    SUBNET=$(sed -n 's/^SUBNET=//p' /etc/opal-mode/bridge-state 2>/dev/null)
+    [ -n "$SUBNET" ] && while iptables -t nat -D zone_wan_postrouting -d "$SUBNET" -j ACCEPT 2>/dev/null; do :; done
+    for d in sta0 sta1 wdsprobe; do iw dev $d del 2>/dev/null; done
+    sleep 1
+}
+
+build_session() {   # needs PHY/BSSID/SSID/KEY/MAC ; rc 1 on assoc failure
+    iw dev "$VIF" del 2>/dev/null
+    iw phy "$PHY" interface add "$VIF" type managed 4addr on || return 1
+    [ -n "$MAC" ] && ip link set "$VIF" address "$MAC" 2>/dev/null
+    mkdir -p "$RUN"
+    printf 'ctrl_interface=%s\nnetwork={\n\tssid="%s"\n\tpsk="%s"\n\tkey_mgmt=WPA-PSK\n\tscan_ssid=1\n}\n' \
+        "$CTRL" "$SSID" "$KEY" > "$CONF"
+    wpa_supplicant -B -i "$VIF" -c "$CONF" -P "$PIDF" >/dev/null 2>&1 || return 1
+    t=0
+    while [ $t -lt 25 ]; do
+        iw dev "$VIF" link 2>/dev/null | grep -q '^Connected to' && break
+        sleep 1; t=$((t+1))
+    done
+    iw dev "$VIF" link 2>/dev/null | grep -q '^Connected to' || return 1
+    brctl addif br-lan "$VIF" 2>/dev/null
+    ip link set "$VIF" up 2>/dev/null
+    BSSID=$(iw dev "$VIF" link | sed -n 's/^Connected to \([0-9a-f:]*\).*/\1/p')
+    return 0
+}
+
+teardown_session() {
+    [ -f "$PIDF" ] && kill "$(cat "$PIDF")" 2>/dev/null
+    brctl delif br-lan "$VIF" 2>/dev/null
+    iw dev "$VIF" del 2>/dev/null
+    rm -f "$STATEF" "$CONF" "$PIDF"
+}
+
+restart_repeater() {
+    /etc/init.d/repeater start 2>/dev/null
+    # gl-repeater can recreate its sta VIFs admin-down and then loop on
+    # "trigger scan fail: Network is down" - nudge them up (observed live)
+    ( sleep 5
+      for d in sta0 sta1; do ip link set $d up 2>/dev/null; done
+      sleep 5
+      for d in sta0 sta1; do ip link set $d up 2>/dev/null; done
+    ) </dev/null >/dev/null 2>&1 &
+}
+
+fallback_to_relayd() {
+    log "falling back to relayd path ($1)"
+    teardown_session
+    [ -f "$MONPIDF" ] && kill "$(cat "$MONPIDF")" 2>/dev/null && rm -f "$MONPIDF"
+    date +%s > "$COOLDOWN"
+    /usr/bin/opal-led bridge-converging
+    restart_repeater
+}
+
+cache_yes() {
+    mkdir -p /etc/opal-mode
+    grep -v "^$BSSID " "$CACHE" > "$CACHE.tmp" 2>/dev/null; mv "$CACHE.tmp" "$CACHE" 2>/dev/null
+    printf '%s %s yes %s\n' "$BSSID" "$SSID" "$(date +%s)" >> "$CACHE"
+    tail -50 "$CACHE" > "$CACHE.tmp" && mv "$CACHE.tmp" "$CACHE"
+}
+
+do_start() {
+    mkdir -p "$RUN" /var/lock
+    exec 9>/var/lock/opal-wds.lock
+    flock -n 9 || { log "already starting/running"; exit 0; }
+    [ -f "$STATEF" ] && { log "wds session already active"; exit 0; }
+    [ "$(cat /etc/opal-mode/current 2>/dev/null)" = "router" ] && exit 0
+    read_network || { log "no selected network in /etc/config/repeater"; exit 1; }
+
+    if [ "$1" != "--force" ]; then
+        CUR_B=$(iw dev sta0 link 2>/dev/null; iw dev sta1 link 2>/dev/null)
+        CUR_B=$(echo "$CUR_B" | sed -n 's/^Connected to \([0-9a-f:]*\).*/\1/p' | head -1)
+        V=$(awk -v b="$CUR_B" '$1==b {print $3}' "$CACHE" 2>/dev/null | tail -1)
+        [ "$V" = "yes" ] || { log "BSSID $CUR_B not cached yes - use --force to try"; exit 1; }
+    fi
+
+    log "starting wds session for '$SSID'"
+    /usr/bin/opal-led bridge-converging
+    own_radio
+    if ! pick_band; then fallback_to_relayd "SSID '$SSID' not found on either band"; exit 1; fi
+    log "band: $PHY ($BSSID at ${SIG}dBm)"
+    if ! build_session; then fallback_to_relayd "association failed on $PHY"; exit 1; fi
+
+    printf 'PHY=%s\nSSID=%s\nBSSID=%s\nSINCE=%s\n' "$PHY" "$SSID" "$BSSID" "$(date +%s)" > "$STATEF"
+    cache_yes
+    rm -f "$COOLDOWN"
+    /usr/bin/opal-led bridge-ok
+    log "wds bridge up: $SSID on $PHY ($BSSID) - real MACs, no relayd"
+    ( "$0" monitor ) </dev/null >/dev/null 2>&1 &
+}
+
+do_stop() {
+    [ -f "$MONPIDF" ] && kill "$(cat "$MONPIDF")" 2>/dev/null && rm -f "$MONPIDF"
+    teardown_session
+    /usr/bin/opal-led bridge-converging
+    restart_repeater
+    log "wds stopped, gl-repeater restarted (relayd path will reconverge)"
+}
+
+do_monitor() {
+    echo $$ > "$MONPIDF"
+    FAILS=0; CYCLE=0; LAST_SWITCH=$(date +%s)
+    . "$STATEF" 2>/dev/null
+    while [ -f "$STATEF" ]; do
+        sleep 30
+        CYCLE=$((CYCLE+1))
+        if kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null && \
+           iw dev "$VIF" link 2>/dev/null | grep -q '^Connected to'; then
+            FAILS=0
+        else
+            FAILS=$((FAILS+1))
+            log "monitor: association lost ($FAILS/3)"
+            if [ $FAILS -ge 3 ]; then
+                # recovery ladder: rebuild on best band, else fallback
+                read_network
+                if pick_band && build_session; then
+                    sed -i "s/^PHY=.*/PHY=$PHY/;s/^BSSID=.*/BSSID=$BSSID/" "$STATEF"
+                    LAST_SWITCH=$(date +%s); FAILS=0
+                    /usr/bin/opal-led bridge-ok
+                    log "monitor: recovered on $PHY ($BSSID)"
+                else
+                    fallback_to_relayd "link dead, no band recoverable"
+                    exit 0
+                fi
+            fi
+            continue
+        fi
+        # band re-evaluation every 10 cycles (~5 min), 10 min min dwell
+        if [ $((CYCLE % 10)) -eq 0 ] && [ $(( $(date +%s) - LAST_SWITCH )) -ge 600 ]; then
+            CUR=$(iw dev "$VIF" link 2>/dev/null | sed -n 's/.*signal: \(-[0-9]*\).*/\1/p')
+            [ -z "$CUR" ] && continue
+            . "$STATEF" 2>/dev/null
+            read_network
+            if [ "$PHY" = "phy1" ] && [ "$CUR" -lt -75 ]; then
+                R2=$(scan_best phy0) || continue
+                S2=${R2##* }
+                if [ "$S2" -ge $((CUR + 10)) ]; then
+                    log "monitor: 5GHz at ${CUR}dBm, 2.4GHz at ${S2}dBm - switching down"
+                    [ -f "$PIDF" ] && kill "$(cat "$PIDF")" 2>/dev/null
+                    brctl delif br-lan "$VIF" 2>/dev/null; iw dev "$VIF" del 2>/dev/null
+                    PHY=phy0; BSSID=${R2%% *}
+                    if build_session; then
+                        sed -i "s/^PHY=.*/PHY=$PHY/;s/^BSSID=.*/BSSID=$BSSID/" "$STATEF"
+                        LAST_SWITCH=$(date +%s); cache_yes
+                        log "monitor: now on 2.4GHz ($BSSID)"
+                    else
+                        fallback_to_relayd "band switch failed"
+                        exit 0
+                    fi
+                fi
+            elif [ "$PHY" = "phy0" ]; then
+                R5=$(scan_best phy1) || continue
+                S5=${R5##* }
+                if [ "$S5" -ge -65 ]; then
+                    log "monitor: 5GHz back at ${S5}dBm - switching up"
+                    [ -f "$PIDF" ] && kill "$(cat "$PIDF")" 2>/dev/null
+                    brctl delif br-lan "$VIF" 2>/dev/null; iw dev "$VIF" del 2>/dev/null
+                    PHY=phy1; BSSID=${R5%% *}
+                    if build_session; then
+                        sed -i "s/^PHY=.*/PHY=$PHY/;s/^BSSID=.*/BSSID=$BSSID/" "$STATEF"
+                        LAST_SWITCH=$(date +%s); cache_yes
+                        log "monitor: now on 5GHz ($BSSID)"
+                    else
+                        fallback_to_relayd "band switch failed"
+                        exit 0
+                    fi
+                fi
+            fi
+        fi
+    done
+    rm -f "$MONPIDF"
+}
+
+do_status() {
+    if [ -f "$STATEF" ]; then
+        . "$STATEF"
+        L=$(iw dev "$VIF" link 2>/dev/null | head -1)
+        S=$(iw dev "$VIF" link 2>/dev/null | sed -n 's/.*signal: \(-[0-9]*\).*/\1/p')
+        echo "wds     : ACTIVE on $PHY - $SSID ($BSSID) ${S:+at ${S}dBm}"
+        echo "link    : ${L:-NOT CONNECTED}"
+    else
+        echo "wds     : inactive (relayd path)"
+    fi
+}
+
+case "$1" in
+    start)   do_start "$2" ;;
+    stop)    do_stop ;;
+    monitor) do_monitor ;;
+    status)  do_status ;;
+    *) echo "usage: opal-wds {start [--force]|stop|status|monitor}" >&2; exit 1 ;;
+esac

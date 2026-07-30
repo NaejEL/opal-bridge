@@ -6,6 +6,8 @@
 [ "$INTERFACE" = "wwan" ] || exit 0
 [ "$ACTION" = "ifup" ] || exit 0
 [ "$(cat /etc/opal-mode/current 2>/dev/null)" = "router" ] && exit 0
+# an active wds session owns the bridge - the relayd machinery stands down
+[ -f /var/run/opal-wds/state ] && exit 0
 STA_IF="$DEVICE"
 [ -z "$STA_IF" ] && exit 0
 STAMP="$(date +%s).$$"
@@ -112,11 +114,20 @@ relaunch "immediate"
   ip addr show "$STA_IF" 2>/dev/null | grep -q "inet " || exit 0
   relaunch "retry-1" ) </dev/null >/dev/null 2>&1 &
 
-# NOTE: no automatic WDS probe here. 4addr WORKS on this hardware (verified
-# end-to-end 2026-07-29, real MACs crossing) but ONLY with exclusive radio
-# ownership: gl-repeater's supplicant must be fully stopped first - a
-# leftover supplicant kills the 4addr data path within ~2 minutes (this
-# masqueraded as a firmware failure for a whole evening). The future wds
-# mode owns that orchestration explicitly; probing casually from hotplug
-# while gl-repeater runs is exactly the wrong way to do it.
-# /usr/lib/opal-bridge/wds-probe = MANUAL diagnostic (opal-mode wds-reprobe).
+# WDS handover: once the relayd bridge has settled, if the connected BSSID
+# is cached "yes" (proven 4addr-capable), hand the bridge to the wds engine
+# (exclusive radio ownership, real MACs, no relayd). The relayd path is thus
+# the universal bootstrap; wds failures fall back here with a 30min cooldown.
+# 4addr requires exclusive ownership: a leftover gl-repeater supplicant
+# kills the 4addr data path in ~2min (masqueraded as a firmware bug for a
+# whole evening). wds-probe = manual diagnostic only.
+( sleep 8
+  [ "$(cat /tmp/relayd.lastevent 2>/dev/null)" = "$STAMP" ] || exit 0
+  [ -x /usr/lib/opal-bridge/opal-wds ] || exit 0
+  CD=$(cat /tmp/opal-wds.cooldown 2>/dev/null || echo 0)
+  [ $(( $(date +%s) - CD )) -lt 1800 ] && exit 0
+  B=$(iw dev "$STA_IF" link 2>/dev/null | sed -n 's/^Connected to \([0-9a-f:]*\).*/\1/p')
+  [ -n "$B" ] || exit 0
+  V=$(awk -v b="$B" '$1==b {print $3}' /etc/opal-mode/wds-cache 2>/dev/null | tail -1)
+  [ "$V" = "yes" ] && /usr/lib/opal-bridge/opal-wds start
+) </dev/null >/dev/null 2>&1 &
