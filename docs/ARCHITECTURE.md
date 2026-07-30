@@ -205,10 +205,17 @@ relayd unnecessary (the sta joins br-lan directly). Probed on device
   shared the same confounder. A clean `killall wpa_supplicant` before
   building the 4addr session makes the problem vanish entirely.
 - GL's `nowds=1` therefore hides a working capability (their UI stack just
-  never orchestrates it). A future wds mode in opal-bridge = stop
-  gl-repeater, run our own supplicant on a 4addr sta enslaved in br-lan —
-  no relayd, no NAT rule, true MAC transparency. Roaming/reconnection
-  duties move to our supplicant (it handles reassociation natively).
+  never orchestrates it). This is now shipped as `/usr/lib/opal-bridge/
+  opal-wds`: the relayd path stays the universal bootstrap, and at the end
+  of each convergence the hotplug hands over to the wds engine when the
+  BSSID is cached 4addr-capable (`opal-mode wds-try` runs the first
+  supervised trial). The engine: exclusive radio ownership, credentials
+  from gl-repeater's own uci store, deterministic band pick (5 GHz first
+  above −70 dBm), own supplicant, sta enslaved in br-lan; a 30 s monitor
+  with a 3-strike recovery ladder, idle-radio band re-evaluation
+  (10 dB/10 min hysteresis), and relayd fallback with a 30 min cooldown.
+  Field-validated: automatic stop→relayd→wds loop in 30 s, supplicant-kill
+  recovery in 90 s, 8.5 h overnight soak at 969/969.
 - Misc: `iw set power_save` is `Not supported` on the Siflower driver;
   `station dump` output on the sta side shows garbage MACs (cosmetic);
   the silent probe stays a manual diagnostic (`opal-mode wds-reprobe`) —

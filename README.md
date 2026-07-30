@@ -90,8 +90,30 @@ nat     : hairpin exemption present
 ## What it is — and isn't
 
 - **IP-transparent L2 bridge**: wired clients get DHCP from the upstream router, live in its subnet, receive broadcast/mDNS. That's what the stock firmware cannot do.
-- **Not MAC-transparent**: like every non-WDS WiFi bridge, all traffic crosses the WiFi link with the Opal's own MAC — standard 802.11 does not let a client transmit frames with another device's source MAC. Consequence: your main router's device list shows one device (the Opal) holding several IPs. Per-client DHCP leases and **MAC reservations on the main router still work** — the real client MAC travels inside the DHCP payload.
-- True MAC passthrough would require 4-address (WDS) support on **both** ends. The Opal side looks feasible (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)); ISP boxes don't cooperate, so if it lands it will be an optional mode for OpenWrt-uplink setups.
+- Against ordinary upstream APs (ISP boxes, hotels): **not MAC-transparent** — like every non-WDS WiFi bridge, traffic crosses the WiFi link with the Opal's own MAC, so the main router's device list shows one device holding several IPs. Per-client DHCP leases and **MAC reservations still work** (the real client MAC travels inside the DHCP payload).
+- **Against a WDS-capable upstream AP (e.g. OpenWrt with `option wds '1'`): full MAC transparency** — see below.
+
+## WDS mode (experimental): real MAC passthrough
+
+When your upstream AP accepts 4-address clients, opal-bridge can replace the
+relay with a **true kernel L2 bridge over WiFi** — wired clients appear
+upstream with their **real MAC addresses**, exactly as if they were cabled.
+Yes, on the very hardware whose vendor flag says `nowds`.
+
+Try it once per network, from SSH (~1 min of disruption, falls back safely):
+
+```sh
+opal-mode wds-try
+```
+
+On success the verdict is cached: from then on, **every convergence on that
+network upgrades itself to WDS automatically** (boot, reconnection, subnet
+change — no interaction). On failure the device stays on the universal relay
+path, and unknown networks always start there — hotels and ISP boxes behave
+exactly as before. `opal-mode status` tells you which path is active. The
+WDS engine picks the band deterministically (5 GHz first when viable),
+re-evaluates it periodically on the idle radio, and falls back to the relay
+path if the link cannot be recovered.
 
 ## Under the hood
 
