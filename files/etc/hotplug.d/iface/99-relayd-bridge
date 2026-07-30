@@ -129,5 +129,12 @@ relaunch "immediate"
   B=$(iw dev "$STA_IF" link 2>/dev/null | sed -n 's/^Connected to \([0-9a-f:]*\).*/\1/p')
   [ -n "$B" ] || exit 0
   V=$(awk -v b="$B" '$1==b {print $3}' /etc/opal-mode/wds-cache 2>/dev/null | tail -1)
+  if [ -z "$V" ]; then
+      # BSSID unknown: inherit by SSID (other band of a known-good AP, or
+      # an AP renamed/re-keyed to the same network) - the engine re-picks
+      # its own band and caches the new BSSID on success
+      S=$(uci -q get wireless.sta.ssid)
+      [ -n "$S" ] && V=$(awk -v s="$S" '$2==s {print $3}' /etc/opal-mode/wds-cache 2>/dev/null | tail -1)
+  fi
   [ "$V" = "yes" ] && /usr/lib/opal-bridge/opal-wds start
 ) </dev/null >/dev/null 2>&1 &
