@@ -86,7 +86,12 @@ build_session() {   # needs PHY/BSSID/SSID/KEY/MAC ; rc 1 on assoc failure
         sleep 1; t=$((t+1))
     done
     iw dev "$VIF" link 2>/dev/null | grep -q '^Connected to' || return 1
+    # pin the bridge MAC BEFORE enslaving wds0: the bridge otherwise adopts
+    # the lowest member MAC, which changes br-lan's MAC and poisons every
+    # neighbour's ARP cache for the management IP (cost us an hour)
+    LANMAC=$(cat /sys/class/net/eth0.1/address 2>/dev/null)
     brctl addif br-lan "$VIF" 2>/dev/null
+    [ -n "$LANMAC" ] && ip link set br-lan address "$LANMAC" 2>/dev/null
     ip link set "$VIF" up 2>/dev/null
     BSSID=$(iw dev "$VIF" link | sed -n 's/^Connected to \([0-9a-f:]*\).*/\1/p')
     return 0
@@ -143,13 +148,17 @@ do_start() {
     fi
 
     log "starting wds session for '$SSID'"
+    # capture the upstream gateway NOW (the relayd-era default route via wwan
+    # still exists) - the monitor needs a data-path target: the association
+    # can stay 'Connected' while the data path is dead (observed live)
+    GATEWAY=$(ip route 2>/dev/null | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -1)
     /usr/bin/opal-led bridge-converging
     own_radio
     if ! pick_band; then fallback_to_relayd "SSID '$SSID' not found on either band"; exit 1; fi
     log "band: $PHY ($BSSID at ${SIG}dBm)"
     if ! build_session; then fallback_to_relayd "association failed on $PHY"; exit 1; fi
 
-    printf 'PHY=%s\nSSID=%s\nBSSID=%s\nSINCE=%s\n' "$PHY" "$SSID" "$BSSID" "$(date +%s)" > "$STATEF"
+    printf 'PHY=%s\nSSID=%s\nBSSID=%s\nGATEWAY=%s\nSINCE=%s\n' "$PHY" "$SSID" "$BSSID" "$GATEWAY" "$(date +%s)" > "$STATEF"
     cache_yes
     rm -f "$COOLDOWN"
     /usr/bin/opal-led bridge-ok
@@ -173,12 +182,21 @@ do_monitor() {
     while [ -f "$STATEF" ]; do
         sleep 30
         CYCLE=$((CYCLE+1))
+        HEALTHY=0
         if kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null && \
            iw dev "$VIF" link 2>/dev/null | grep -q '^Connected to'; then
+            # assoc up is NOT enough: check the DATA path (the firmware can
+            # black-hole data while the association looks fine)
+            if [ -z "$GATEWAY" ] || ping -c 1 -W 2 "$GATEWAY" >/dev/null 2>&1 \
+               || ping -c 1 -W 2 "$GATEWAY" >/dev/null 2>&1; then
+                HEALTHY=1
+            fi
+        fi
+        if [ $HEALTHY -eq 1 ]; then
             FAILS=0
         else
             FAILS=$((FAILS+1))
-            log "monitor: association lost ($FAILS/3)"
+            log "monitor: link unhealthy ($FAILS/3)"
             if [ $FAILS -ge 3 ]; then
                 # recovery ladder: rebuild on best band, else fallback
                 read_network
